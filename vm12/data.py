@@ -233,6 +233,37 @@ class PlainTextSeqDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Mixed dataset
+# ---------------------------------------------------------------------------
+
+class MixedSeqDataset(Dataset):
+    """Combines conversation and plaintext datasets.
+
+    All samples are normalized to 3-tuples: (input, target, mask).
+    Plaintext samples get an all-ones mask (predict every position).
+    """
+
+    def __init__(self, convo_dataset=None, plaintext_dataset=None):
+        self.convo = convo_dataset
+        self.plain = plaintext_dataset
+        self.convo_len = len(convo_dataset) if convo_dataset else 0
+        self.plain_len = len(plaintext_dataset) if plaintext_dataset else 0
+
+    def __len__(self):
+        return self.convo_len + self.plain_len
+
+    def __getitem__(self, idx):
+        if idx < self.convo_len:
+            return self.convo[idx]  # already (input, target, mask)
+        else:
+            plain_idx = idx - self.convo_len
+            input_seq, target_seq = self.plain[plain_idx]
+            # All-ones mask: predict every position
+            mask = torch.ones_like(target_seq, dtype=torch.float)
+            return input_seq, target_seq, mask
+
+
+# ---------------------------------------------------------------------------
 # Shared
 # ---------------------------------------------------------------------------
 
@@ -251,27 +282,105 @@ def collate_seq(batch):
         return (torch.stack(inputs), torch.stack(targets))
 
 
-def _detect_conversation_format(path: str) -> bool:
-    """Check if data contains <INPUT>...</INPUT> markers."""
-    p = Path(path)
-    if p.is_dir():
-        for f in sorted(p.glob("*.txt"))[:5]:
-            if '</INPUT>' in f.read_text(encoding='utf-8', errors='ignore')[:2000]:
-                return True
+def _is_conversation_file(path: Path) -> bool:
+    """Check if a single file contains <INPUT>...</INPUT> markers."""
+    try:
+        head = path.read_text(encoding='utf-8', errors='ignore')[:2000]
+        return '</INPUT>' in head
+    except Exception:
         return False
-    return '</INPUT>' in p.read_text(encoding='utf-8', errors='ignore')[:2000]
 
 
 def create_dataloaders(config, text_path: str = None,
                        val_split: float = 0.1, num_workers: int = 0):
-    """Load data, auto-detect format, return train/val loaders."""
-    is_conversation = (text_path and os.path.exists(text_path)
-                       and _detect_conversation_format(text_path))
+    """Load data, auto-detect format, return train/val loaders.
 
-    if is_conversation:
+    When text_path is a directory, each .txt file is classified independently
+    as conversation or plaintext. Both types are loaded and combined into a
+    single MixedSeqDataset.
+    """
+    p = Path(text_path) if text_path else None
+
+    if p and p.is_dir():
+        return _create_mixed_loaders(config, p, val_split, num_workers)
+    elif p and p.exists() and _is_conversation_file(p):
         return _create_conversation_loaders(config, text_path, val_split, num_workers)
     else:
         return _create_plaintext_loaders(config, text_path, val_split, num_workers)
+
+
+def _create_mixed_loaders(config, dir_path: Path, val_split, num_workers):
+    """Load a directory with a mix of conversation and plaintext files."""
+    convo_files = []
+    plain_files = []
+
+    for f in sorted(dir_path.glob("*.txt")):
+        if _is_conversation_file(f):
+            convo_files.append(f)
+        else:
+            plain_files.append(f)
+
+    print(f"Directory {dir_path}: {len(convo_files)} conversation + {len(plain_files)} plaintext files")
+
+    # --- Conversation data ---
+    convo_train_ds = None
+    convo_val_ds = None
+    if convo_files:
+        all_convos = []
+        for f in convo_files:
+            all_convos.extend(parse_conversation_file(str(f)))
+        random.shuffle(all_convos)
+        encoded = [_encode_full_conversation(c) for c in all_convos]
+
+        split_idx = int(len(encoded) * (1 - val_split))
+        convo_train_ds = ConversationSeqDataset(encoded[:split_idx], config.context_len)
+        convo_val_ds = ConversationSeqDataset(encoded[split_idx:], config.context_len)
+
+        total_turns = sum(len(c) for c in all_convos)
+        total_chars = sum(len(ids) for ids, _ in encoded)
+        print(f"  Conversations: {len(all_convos):,} ({total_turns:,} turns, {total_chars:,} chars)")
+        print(f"  Convo chunks: {len(convo_train_ds):,} train, {len(convo_val_ds):,} val")
+
+    # --- Plaintext data ---
+    plain_train_ds = None
+    plain_val_ds = None
+    if plain_files:
+        texts = []
+        for f in plain_files:
+            raw = f.read_text(encoding='utf-8', errors='ignore')
+            raw = _strip_gutenberg(raw)
+            raw = _clean_text(raw)
+            texts.append(raw)
+            print(f"  Plaintext {f.name}: {len(raw):,} chars")
+
+        combined = ' '.join(texts)
+        encoded_plain = encode(combined)
+
+        split_idx = int(len(encoded_plain) * (1 - val_split))
+        plain_train_ds = PlainTextSeqDataset(encoded_plain[:split_idx], config.context_len)
+        plain_val_ds = PlainTextSeqDataset(encoded_plain[split_idx:], config.context_len)
+
+        print(f"  Plaintext total: {len(combined):,} chars, {len(encoded_plain):,} tokens")
+        print(f"  Plain chunks: {len(plain_train_ds):,} train, {len(plain_val_ds):,} val")
+
+    # --- Combine ---
+    train_ds = MixedSeqDataset(convo_train_ds, plain_train_ds)
+    val_ds = MixedSeqDataset(convo_val_ds, plain_val_ds)
+
+    print(f"Combined: {len(train_ds):,} train chunks, {len(val_ds):,} val chunks "
+          f"(context_len={config.context_len})")
+
+    train_loader = DataLoader(
+        train_ds, batch_size=config.batch_size, shuffle=True,
+        num_workers=num_workers, collate_fn=collate_seq,
+        pin_memory=False, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=config.batch_size, shuffle=False,
+        num_workers=num_workers, collate_fn=collate_seq,
+        pin_memory=False, drop_last=True,
+    )
+    return train_loader, val_loader
 
 
 def _create_conversation_loaders(config, text_path, val_split, num_workers):
@@ -339,3 +448,4 @@ def _create_plaintext_loaders(config, text_path, val_split, num_workers):
         pin_memory=False, drop_last=True,
     )
     return train_loader, val_loader
+
