@@ -23,8 +23,9 @@ class WordSpanLoss(nn.Module):
     No external tokenizer needed — uses space (token 63) as word boundary.
     """
 
-    def __init__(self):
+    def __init__(self, downsample_stride: int = 2):
         super().__init__()
+        self.downsample_stride = downsample_stride
 
     def forward(self, word_preds: torch.Tensor, char_features: torch.Tensor,
                 target_chars: torch.Tensor) -> torch.Tensor:
@@ -65,8 +66,7 @@ class WordSpanLoss(nn.Module):
                 target = span_feats.mean(dim=1)  # (feat_dim,)
 
                 # Prediction: from the downsampled word-level at corresponding position
-                # Map char position to word-level position (stride-2 downsampling)
-                word_pos = pos // 2
+                word_pos = pos // self.downsample_stride
                 if word_pos >= word_preds.size(2):
                     continue
 
@@ -143,7 +143,8 @@ class HierarchicalLoss(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.word_loss = WordSpanLoss()
+        stride = config.level_configs[0].downsample_stride
+        self.word_loss = WordSpanLoss(downsample_stride=stride)
         self.contrastive_loss = InfoNCELoss(temperature=config.contrastive_temp)
 
     def forward(self, model_output: dict, targets: torch.Tensor,

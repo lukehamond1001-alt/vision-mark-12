@@ -267,12 +267,13 @@ class HierarchicalModel(nn.Module):
             ))
 
         # --- Dense skip connections ---
-        # Project higher encoder levels down to contribute gradient to lower levels
+        # Project higher encoder levels down to level i's width and add
+        # to encoder skip before passing to decoder.  This ensures every
+        # encoder level receives gradient from ALL levels above it.
         self.dense_skips = nn.ModuleList()
         for i in range(n):
             level_projs = nn.ModuleList()
             for j in range(i + 1, n):
-                # Project from level j width to level i width
                 level_projs.append(nn.Conv1d(
                     config.level_configs[j].width,
                     config.level_configs[i].width,
@@ -325,8 +326,39 @@ class HierarchicalModel(nn.Module):
 
         return features
 
+    def _enrich_skip(self, encoder_features: list[torch.Tensor],
+                     level_idx: int) -> torch.Tensor:
+        """Add dense skip projections from all higher encoder levels.
+
+        For encoder level `level_idx`, project each higher-level feature
+        (j > level_idx) down to level_idx's width and spatial resolution,
+        then add to the skip connection. This ensures level_idx receives
+        gradient from every level above, not just the one directly above.
+        """
+        skip = encoder_features[level_idx]  # (batch, w_i, seq_len_i)
+        projs = self.dense_skips[level_idx]  # ModuleList of Conv1d projections
+
+        for proj_idx, j in enumerate(range(level_idx + 1, self.config.num_levels)):
+            higher = encoder_features[j]  # (batch, w_j, seq_len_j)
+            projected = projs[proj_idx](higher)  # (batch, w_i, seq_len_j)
+
+            # Upsample to match level_idx's spatial length
+            target_len = skip.size(2)
+            if projected.size(2) != target_len:
+                projected = F.interpolate(
+                    projected, size=target_len, mode='nearest'
+                )
+
+            skip = skip + projected
+
+        return skip
+
     def decode(self, encoder_features: list[torch.Tensor]) -> torch.Tensor:
-        """Run the decoder top-down with skip connections.
+        """Run the decoder top-down with dense skip connections.
+
+        At each decoder level, the encoder skip is enriched with projected
+        features from ALL higher encoder levels before being concatenated
+        with the upsampled decoder output from above.
 
         Args:
             encoder_features: list of encoder outputs, one per level
@@ -341,7 +373,7 @@ class HierarchicalModel(nn.Module):
 
         # Decode downward: level n-2 → 0
         for dec_idx, level_idx in enumerate(range(n - 2, -1, -1)):
-            skip = encoder_features[level_idx]
+            skip = self._enrich_skip(encoder_features, level_idx)
             h = self.decoder_levels[dec_idx](h, skip)
 
         return h
