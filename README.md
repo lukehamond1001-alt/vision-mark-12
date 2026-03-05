@@ -4,7 +4,7 @@ Convolutional LLM that predicts **all output characters in a single forward pass
 
 No attention, no learned embeddings, no autoregressive loop. One pass in, entire response out.
 
-**~1.6M parameters**
+**3.23M parameters**
 
 ## Architecture
 
@@ -36,7 +36,7 @@ Output: Conv1d(512 → 99) at EVERY position
 - **No embeddings** — raw one-hot vectors, no learned embedding table
 - **No autoregressive loop** — inference is O(1) forward passes, not O(n)
 - **Iterative refinement** — optional 1-2 extra passes to polish output coherence
-- **Dilated receptive field** — scanner (10 chars) + dilated convs (16 chars) = 26+ character context
+- **Dilated receptive field** — scanner (10 chars) + dilated convs (30 chars) = 40 character context
 
 ## How Inference Works
 
@@ -51,6 +51,46 @@ Vision Mark 12 (convolutional):
 ```
 
 The model outputs a prediction at every position simultaneously. Position i predicts character i+1. No feeding output back in. Optional refinement passes can improve coherence.
+
+## Training Results
+
+Trained on 1,576 conversations (3,200 turns, 865K response characters) from Project Gutenberg formatted as `<INPUT>...</INPUT>` conversations. Apple M4 (MPS), batch size 32, context length 256.
+
+| Step | Train Loss | Train Acc | Val Loss | Val Acc |
+|------|-----------|-----------|----------|---------|
+| 100 | 2.449 | 33.9% | — | — |
+| 500 | 0.773 | 78.5% | 1.850 | 54.9% |
+| 1000 | 0.195 | 94.4% | 2.484 | 54.0% |
+| 2000 | 0.097 | 97.5% | 3.124 | 55.1% |
+| 4000 | 0.069 | 98.0% | 3.468 | 54.7% |
+| 6000 | 0.052 | 98.4% | 3.808 | 54.4% |
+| 8500 | 0.041 | 98.7% | 4.195 | 54.1% |
+
+### Observations
+
+- **Train accuracy rapidly reaches 98.7%** — the model memorizes the training data effectively
+- **Val accuracy plateaus at ~54%** — significant overfitting, which is expected with 865K chars and 3.23M params
+- **Train loss still decreasing** at step 8,500 — model continues to compress training data
+- **One-pass generation** produces character sequences but lacks coherence — the core mechanism works but needs more data and architectural refinements
+
+### Generation Samples (step 8,500)
+
+```
+1-pass:  "What is the capital of France?" → "A.tsl 000H0000600000RNRRYN..."
+refined: "What is the capital of France?" → "Ardsyoemmovr huesautI  txe..."
+
+1-pass:  "Tell me about dogs" → " tW4e0 000000000YN00R0AYY..."
+refined: "Tell me about dogs" → " youesion,dtsooehtnmgbnwf..."
+```
+
+One-pass produces garbled output. Refinement passes produce more character-like text but without semantic meaning. The architecture successfully generates 40 characters in a single forward pass — the parallel prediction mechanism works — but coherent language generation requires larger receptive fields and more training data.
+
+### Key Takeaways
+
+1. **Parallel prediction works** — all positions fire simultaneously in one pass
+2. **Overfitting is the bottleneck** — 3.23M params on 865K chars leads to memorization
+3. **40-char receptive field is too small** for sentence-level coherence
+4. **Next steps**: larger dilation patterns, more data, or deeper stacks to extend the receptive field
 
 ## Usage
 
