@@ -1,8 +1,11 @@
 """Training loop for Vision Mark 12.
 
-All-position next-character prediction with dilated causal convolutions.
-One forward pass predicts the next char at every position simultaneously.
-Supports MPS, CUDA, and CPU. AdamW optimizer, gradient clipping.
+Supports two modes:
+1. Legacy VM12 (flat model):   python -m vm12.train --text-path data.txt
+2. Hierarchical staged:        python -m vm12.staged_trainer --text-path data.txt
+
+This file retains the legacy single-stage training loop for the original
+VM12Model. For hierarchical training, use staged_trainer.py.
 """
 
 import argparse
@@ -86,24 +89,16 @@ def evaluate(model: VM12Model, val_loader, device: torch.device,
 @torch.no_grad()
 def demo_prediction(model: VM12Model, text: str, device: torch.device,
                     n_chars: int = 40) -> str:
-    """Generate n_chars in ONE forward pass.
-
-    Feeds the prompt, then reads predicted characters from positions
-    after the prompt — no autoregressive loop.
-    """
+    """Generate n_chars in ONE forward pass."""
     model.eval()
     ids = encode_input(text)
     prompt_len = len(ids)
 
-    # Pad input with zeros for the generation positions
-    full_len = prompt_len + n_chars
     full_ids = ids + [0] * n_chars
     x = torch.tensor([full_ids], dtype=torch.long, device=device)
 
-    logits = model(x)  # (1, full_len, vocab) — ONE forward pass
+    logits = model(x)
 
-    # Read predictions at positions prompt_len-1 through prompt_len+n_chars-2
-    # Position i predicts char at i+1, so position prompt_len-1 predicts first gen char
     generated = []
     for i in range(n_chars):
         pred_pos = prompt_len - 1 + i
@@ -119,16 +114,11 @@ def demo_prediction(model: VM12Model, text: str, device: torch.device,
 @torch.no_grad()
 def demo_prediction_refined(model: VM12Model, text: str, device: torch.device,
                             n_chars: int = 40, n_refine: int = 2) -> str:
-    """Generate with iterative refinement.
-
-    Pass 0: one-shot generation (same as demo_prediction)
-    Pass 1..n_refine: feed the generated text back in to refine predictions.
-    """
+    """Generate with iterative refinement."""
     model.eval()
     ids = encode_input(text)
     prompt_len = len(ids)
 
-    # Pass 0: initial generation
     full_ids = ids + [0] * n_chars
     x = torch.tensor([full_ids], dtype=torch.long, device=device)
     logits = model(x)
@@ -140,7 +130,6 @@ def demo_prediction_refined(model: VM12Model, text: str, device: torch.device,
             break
         generated.append(logits[0, pred_pos].argmax().item())
 
-    # Refinement passes
     for _ in range(n_refine):
         refined_ids = ids + generated
         x = torch.tensor([refined_ids], dtype=torch.long, device=device)
@@ -159,6 +148,7 @@ def demo_prediction_refined(model: VM12Model, text: str, device: torch.device,
 
 
 def train(config: VM12Config, text_path: str = None, resume: bool = True):
+    """Legacy training loop for flat VM12Model."""
     device = get_device()
     print(f"Device: {device}")
 
@@ -217,9 +207,8 @@ def train(config: VM12Config, text_path: str = None, resume: bool = True):
                 x, y = x.to(device), y.to(device)
                 mask = None
 
-            logits = model(x)  # (batch, seq_len, vocab)
+            logits = model(x)
 
-            # All-position cross entropy
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1),
                                    reduction='none')
             loss = loss.reshape_as(y)
@@ -238,7 +227,6 @@ def train(config: VM12Config, text_path: str = None, resume: bool = True):
             optimizer.step()
             optimizer.zero_grad()
 
-            # Tracking
             running_loss += loss_scalar.item()
             preds = logits.argmax(dim=-1)
             if mask is not None:
@@ -299,7 +287,7 @@ def _save_checkpoint(model, optimizer, step, best_val_loss, config, path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Vision Mark 12")
+    parser = argparse.ArgumentParser(description="Train Vision Mark 12 (legacy flat model)")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=200_000)

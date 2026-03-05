@@ -1,147 +1,127 @@
-# Vision Mark 12
+# Vision Mark 12 — Hierarchical Convolutional LLM
 
-Convolutional LLM that predicts **all output characters in a single forward pass**.
+Convolutional language model that compresses characters into word → phrase → idea representations, then decodes back to text.
 
-No attention, no learned embeddings, no autoregressive loop. One pass in, entire response out.
-
-**3.23M parameters**
+**31.9M parameters** · **~460 char receptive field** · **No attention, no embeddings**
 
 ## Architecture
 
 ```
-Input: "What is the capital of France?"
-  → one-hot encoding (99-dim per character)
-  ↓
-Multi-Scale Scanner (Conv1d, kernel sizes 1-10, 3 filters each)
-  30 features per position (3 filters × 10 scales)
-  ↓
-Projection: Conv1d(30 → 512) + ReLU
-  ↓
-Dilated Causal Blocks (residual connections):
-  Block 1: Conv1d(512, 512, k=3, dilation=1)  + RMSNorm + ReLU
-  Block 2: Conv1d(512, 512, k=3, dilation=2)  + RMSNorm + ReLU
-  Block 3: Conv1d(512, 512, k=3, dilation=4)  + RMSNorm + ReLU
-  Block 4: Conv1d(512, 512, k=3, dilation=8)  + RMSNorm + ReLU
-  ↓
-Output: Conv1d(512 → 99) at EVERY position
-  ↓
-"The capital of France is Paris."  ← predicted all at once
+INPUT CHARACTERS (batch, seq_len)
+      ↓ one-hot(99)
+Level 0: Scanner (k=1..10) + Dilated Blocks [1,2,4,8]     ← 3.2M params
+      ↓ downsample (Conv1d k=4, stride=2)
+Level 1: Word Scanner + Dilated Blocks [1,2,4,8]           ← 3.1M params
+      ↓ downsample (Conv1d k=4, stride=2)
+Level 2: Phrase Scanner + Dilated Blocks [1,2,4,8]         ← 3.1M params
+      ↓ downsample (Conv1d k=4, stride=2)
+Level 3: Idea Scanner + Dilated Blocks [1,2,4,8]           ← 3.1M params
+      ↓
+      IDEA REPRESENTATION
+      ↓
+Decoder L2: Upsample + Skip(Encoder L2) + Dilated Blocks   ← 4.7M params
+Decoder L1: Upsample + Skip(Encoder L1) + Dilated Blocks   ← 4.7M params
+Decoder L0: Upsample + Skip(Encoder L0) + Dilated Blocks   ← 4.7M params
+      ↓
+OUTPUT LOGITS (batch, seq_len, 99)
 ```
 
-## What Makes This Different
+## What's New (v12.1 — Hierarchical)
 
-- **Parallel generation** — predicts all output characters in one forward pass, not one-at-a-time
-- **No attention** — uses multi-scale convolutions + dilated causal convolutions
-- **Character-level** — works on raw characters (99 vocab), not subword tokens
-- **No embeddings** — raw one-hot vectors, no learned embedding table
-- **No autoregressive loop** — inference is O(1) forward passes, not O(n)
-- **Iterative refinement** — optional 1-2 extra passes to polish output coherence
-- **Dilated receptive field** — scanner (10 chars) + dilated convs (30 chars) = 40 character context
+The original VM12 had a ~40 character receptive field, which was too small for coherent generation. The hierarchical version:
 
-## How Inference Works
+- **4-level encoder** stacks scanner + dilated blocks, downsampling by 2× between levels
+- **U-Net decoder** with skip connections from encoder → decoder at each level
+- **Dense skip connections** so every level gets gradient from all levels above
+- **3 loss types**: char prediction (L0), word-span-to-space (L1), contrastive InfoNCE (L2-L3)
+- **6-stage training**: freeze lower levels as you build upward, then joint fine-tune
 
-```
-Traditional LLM (transformer):
-  "France?" → "T" → "Th" → "The" → ... → "The capital is Paris."
-  N forward passes for N characters (slow)
+### Receptive Field
 
-Vision Mark 12 (convolutional):
-  "France?" → "The capital is Paris."
-  1 forward pass for ALL characters (fast)
-```
+| Level | Effective span |
+|-------|---------------|
+| 0 — Char | ~40 chars |
+| 1 — Word | ~60 chars |
+| 2 — Phrase | ~120 chars |
+| 3 — Idea | ~240 chars |
+| **Combined** | **~460 chars** |
 
-The model outputs a prediction at every position simultaneously. Position i predicts character i+1. No feeding output back in. Optional refinement passes can improve coherence.
+### Training Stages
 
-## Training Results
-
-Trained on 1,576 conversations (3,200 turns, 865K response characters) from Project Gutenberg formatted as `<INPUT>...</INPUT>` conversations. Apple M4 (MPS), batch size 32, context length 256.
-
-| Step | Train Loss | Train Acc | Val Loss | Val Acc |
-|------|-----------|-----------|----------|---------|
-| 100 | 2.449 | 33.9% | — | — |
-| 500 | 0.773 | 78.5% | 1.850 | 54.9% |
-| 1000 | 0.195 | 94.4% | 2.484 | 54.0% |
-| 2000 | 0.097 | 97.5% | 3.124 | 55.1% |
-| 4000 | 0.069 | 98.0% | 3.468 | 54.7% |
-| 6000 | 0.052 | 98.4% | 3.808 | 54.4% |
-| 8500 | 0.041 | 98.7% | 4.195 | 54.1% |
-
-### Observations
-
-- **Train accuracy rapidly reaches 98.7%** — the model memorizes the training data effectively
-- **Val accuracy plateaus at ~54%** — significant overfitting, which is expected with 865K chars and 3.23M params
-- **Train loss still decreasing** at step 8,500 — model continues to compress training data
-- **One-pass generation** produces character sequences but lacks coherence — the core mechanism works but needs more data and architectural refinements
-
-### Generation Samples (step 8,500)
-
-```
-1-pass:  "What is the capital of France?" → "A.tsl 000H0000600000RNRRYN..."
-refined: "What is the capital of France?" → "Ardsyoemmovr huesautI  txe..."
-
-1-pass:  "Tell me about dogs" → " tW4e0 000000000YN00R0AYY..."
-refined: "Tell me about dogs" → " youesion,dtsooehtnmgbnwf..."
-```
-
-One-pass produces garbled output. Refinement passes produce more character-like text but without semantic meaning. The architecture successfully generates 40 characters in a single forward pass — the parallel prediction mechanism works — but coherent language generation requires larger receptive fields and more training data.
-
-### Key Takeaways
-
-1. **Parallel prediction works** — all positions fire simultaneously in one pass
-2. **Overfitting is the bottleneck** — 3.23M params on 865K chars leads to memorization
-3. **40-char receptive field is too small** for sentence-level coherence
-4. **Next steps**: larger dilation patterns, more data, or deeper stacks to extend the receptive field
+| Stage | What trains | What's frozen | Active losses |
+|-------|------------|--------------|---------------|
+| 1 | Level 0 encoder | everything else | char |
+| 2 | Level 1 + downsample | Level 0 | char, word-span |
+| 3 | Level 2 + downsample | Levels 0-1 | char, word, contrastive |
+| 4 | Level 3 + downsample | Levels 0-2 | char, word, contrastive |
+| 5 | Decoder + output head | all encoder | char, word, contrastive |
+| 6 | everything | nothing | all (low LR) |
 
 ## Usage
 
+### Hierarchical (staged training)
+
 ```bash
-# View encoding
+# Full 6-stage training
+python -m vm12.staged_trainer --text-path gutenberg_convos.txt --batch-size 32
+
+# Start from a specific stage
+python -m vm12.staged_trainer --text-path gutenberg_convos.txt --start-stage 3
+
+# Custom steps per stage
+python -m vm12.staged_trainer --text-path data.txt --stage-steps 50000,30000,20000,20000,30000,50000
+
+# Fresh start (no checkpoint resume)
+python -m vm12.staged_trainer --text-path data.txt --no-resume
+```
+
+### Legacy (flat VM12)
+
+```bash
+# Original single-stage training
+python -m vm12.train --text-path gutenberg_convos.txt --batch-size 32
+
+# Quick test
+python -m vm12.train --text-path training_data.txt --max-steps 200 --no-resume
+```
+
+### Encoding
+
+```bash
 python -m vm12.encode "Hello, World!"
-
-# Train on conversation data
-python -m vm12.train --text-path gutenberg_convos.txt --batch-size 32 --lr 0.001 --no-resume
-
-# Train on plain text
-python -m vm12.train --text-path training_data.txt --no-resume
-
-# Resume training
-python -m vm12.train --text-path gutenberg_convos.txt
-
-# Custom context length
-python -m vm12.train --text-path training_data.txt --context-len 512
-
-# Quick test (200 steps)
-python -m vm12.train --text-path training_data.txt --max-steps 200 --batch-size 8 --no-resume
 ```
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `vm12/encode.py` | 99-char encoding, `<START>`, `<INPUT>`, `</INPUT>` tokens |
+| `vm12/config.py` | Per-level configs, loss weights, contrastive params |
+| `vm12/hierarchy.py` | `HierarchicalModel` — encoder, decoder, U-Net skips, dense gradients |
+| `vm12/losses.py` | `WordSpanLoss`, `InfoNCELoss`, `HierarchicalLoss` |
+| `vm12/staged_trainer.py` | 6-stage training pipeline with freeze/unfreeze, CLI |
 | `vm12/scanning_block.py` | Multi-scale Scanner (Conv1d, kernel sizes 1-K) |
-| `vm12/model.py` | VM12Model — scanner + dilated causal blocks + all-position output |
-| `vm12/config.py` | Hyperparameters (dilation pattern, context length, etc.) |
-| `vm12/data.py` | Sequence datasets with shifted targets (conversation + plain text) |
-| `vm12/train.py` | Training loop, eval, one-pass generation, iterative refinement |
+| `vm12/model.py` | Legacy `VM12Model` (flat baseline) |
+| `vm12/encode.py` | 99-char encoding, `<START>`, `<INPUT>`, `</INPUT>` tokens |
+| `vm12/data.py` | Sequence datasets (conversation + plain text) |
+| `vm12/train.py` | Legacy single-stage training loop |
 | `scripts/generate_data.py` | Gemini API synthetic conversation generator |
 
 ## Key Design Decisions
 
-### Why all-position prediction?
-Convolutions compute features at every position in parallel. Traditional models throw away all but the last position. We use all of them — every position predicts its next character. This means training gets N gradient signals per sequence instead of 1.
+### Why hierarchical?
+The original VM12 had ~40 chars of context. Stacking 4 levels with stride-2 downsampling gives ~460 chars — enough for paragraph-level reasoning. Each level's scanner sees ~30 positions, but those positions represent increasingly abstract features.
 
-### Why dilated convolutions?
-Stacking dilations [1, 2, 4, 8] with kernel size 3 gives an exponentially growing receptive field:
-- Block 1: sees 3 positions
-- Block 2: sees 7 positions
-- Block 3: sees 15 positions
-- Block 4: sees 31 positions
+### Why U-Net decoder?
+Skip connections from encoder to decoder carry fine-grained detail. Without them, the decoder must reconstruct character-level information from a compressed idea vector — too lossy. With them, the decoder can focus on high-level decisions while low-level detail flows through the skips.
 
-Combined with the scanner (10 positions), each output sees ~26 characters of context.
+### Why staged training?
+Training compression and reasoning from scratch simultaneously fails — gradients from upper levels are meaningless before lower levels have learned to compress. Freeze-and-stack (like WaveNet, VQ-VAE-2) lets each level learn its job before the next level builds on it.
 
-### Why iterative refinement?
-In one-pass generation, position 5 doesn't know what position 4 predicted. This can cause incoherence. By feeding the first-pass output back in for 1-2 more passes, each position can see what its neighbors produced and refine accordingly.
+### Why contrastive loss at upper levels?
+Phrase and idea levels don't have clear next-token prediction targets. InfoNCE contrastive loss (adjacent passages = positive, different documents = negative) gives them a semantically meaningful objective without needing labels.
+
+### Why stride-2 instead of stride-4?
+Characters are information-dense — one character can change meaning ("bat" vs "cat"). Stride-2 with kernel-4 gives 50% overlap, so every character contributes to at least two positions at the next level. Safer than stride-4 for char-level models.
 
 ## Requirements
 
